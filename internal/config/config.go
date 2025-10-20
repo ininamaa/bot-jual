@@ -57,7 +57,7 @@ func Load() (*Config, error) {
 		AtlanticWebhookSecretMD5Username: trimmedEnv("ATL_WEBHOOK_SECRET_MD5_USERNAME"),
 		AtlanticWebhookSecretMD5Password: trimmedEnv("ATL_WEBHOOK_SECRET_MD5_PASSWORD"),
 		GeminiAPIKeys:                    splitAndTrim(trimmedEnv("GEMINI_KEYS")),
-		GeminiModel:                      getenvDefault("GEMINI_MODEL_FLASH_LITE", "gemini-1.5-flash-latest"),
+		GeminiModel:                      getenvDefault("GEMINI_MODEL_FLASH_LITE", "gemini-2.5-flash-lite"),
 		MetricsNamespace:                 getenvDefault("METRICS_NAMESPACE", "bot_jual"),
 		RedisAddr:                        getenvDefault("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:                    trimmedEnv("REDIS_PASSWORD"),

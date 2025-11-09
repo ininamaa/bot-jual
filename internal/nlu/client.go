@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -114,6 +116,28 @@ func (c *Client) DetectIntent(ctx context.Context, input IntentInput) (*IntentRe
 
 	var result IntentResult
 	if err := json.Unmarshal([]byte(normalised), &result); err != nil {
+		// Try to salvage partially truncated JSON first from the normalised text, then raw response.
+		if partial, perr := fallbackParseIntent(normalised); perr == nil && partial != nil {
+			if partial.Entities == nil {
+				partial.Entities = map[string]string{}
+			}
+			if partial.ToolCall != nil && partial.ToolCall.Arguments == nil {
+				partial.ToolCall.Arguments = map[string]string{}
+			}
+			c.logger.Debug("intent detected via fallback(normalised)", "intent", partial.Intent, "confidence", partial.Confidence, "key", keyUsed)
+			return partial, nil
+		}
+		if partial, perr := fallbackParseIntent(res); perr == nil && partial != nil {
+			if partial.Entities == nil {
+				partial.Entities = map[string]string{}
+			}
+			if partial.ToolCall != nil && partial.ToolCall.Arguments == nil {
+				partial.ToolCall.Arguments = map[string]string{}
+			}
+			c.logger.Debug("intent detected via fallback(raw)", "intent", partial.Intent, "confidence", partial.Confidence, "key", keyUsed)
+			return partial, nil
+		}
+		// If fallback fails, return original parse error with snippet for debugging.
 		c.metrics.Errors.WithLabelValues("nlu").Inc()
 		snippet := res
 		if len(snippet) > 200 {
@@ -244,7 +268,10 @@ func buildIntentPrompt(input IntentInput) geminiRequest {
 	sb.WriteString("Tips parsing ID game:\n")
 	sb.WriteString("- Tangkap kata kunci ID seperti \"id\", \"uid\", \"akun\", \"player id\", \"target\".\n")
 	sb.WriteString("- Tangkap kata kunci server/zone seperti \"server\", \"sv\", \"srv\", \"zone\"; simpan ke entities.customer_zone bila disebut.\n")
-	sb.WriteString("- Jika user menyebut dua nomor berurutan (contoh: \"69827740 2126\" atau \"69827740-2126\"), gabungkan sebagai customer_id \"69827740(2126)\".\n\n")
+	sb.WriteString("- Jika user menyebut dua nomor berurutan (contoh: \"69827740 2126\" atau \"69827740-2126\"), gabungkan sebagai customer_id \"69827740(2126)\".\n")
+	sb.WriteString("- Perhatikan pattern \"Beli X Y (Z)\" dimana X=product_code, Y=customer_id, Z=zone. Contoh: \"Beli 3dm 69827740 (2126)\" harus menghasilkan product_code=\"3DM\", customer_id=\"69827740(2126)\".\n")
+	sb.WriteString("- Product code bisa dalam format lowercase (3dm) atau uppercase (3DM), selalu konversi ke uppercase.\n")
+	sb.WriteString("- Jika user menyebut \"via saldo ya mas\" atau \"pakai saldo\", anggap sebagai payment_method=\"deposit\".\n\n")
 	sb.WriteString("Contoh:\n")
 	sb.WriteString("User: \"pulsa telkomsel 20k\"\n")
 	sb.WriteString(`Output: {"intent":"price_lookup","confidence":0.9,"reply":"","requires_confirmation":false,"entities":{"product_query":"pulsa telkomsel 20k","product_type":"prabayar"}}` + "\n")
@@ -255,7 +282,19 @@ func buildIntentPrompt(input IntentInput) geminiRequest {
 	sb.WriteString("User: \"bantu deposit 150k via qris dong\"\n")
 	sb.WriteString(`Output: {"intent":"create_deposit","confidence":0.9,"reply":"Oke, aku buatin deposit QRIS-nya.","requires_confirmation":false,"entities":{"method":"qris","amount":"150000"},"tool_call":{"name":"deposit_create","arguments":{"metode":"qris","nominal":"150000"}}}` + "\n")
 	sb.WriteString("User: \"tolong isi ML3 ke id 69827740 server 2126 pakai saldo\"\n")
-	sb.WriteString(`Output: {"intent":"create_prepaid","confidence":0.94,"reply":"Siap, aku proses dengan saldo ya.","requires_confirmation":false,"entities":{"product_code":"ML3","customer_id":"69827740(2126)","customer_zone":"2126","payment_method":"deposit"},"tool_call":{"name":"transaksi_create","arguments":{"code":"ML3","target":"69827740(2126)","metode":"deposit","server":"2126"}}}` + "\n\n")
+	sb.WriteString(`Output: {"intent":"create_prepaid","confidence":0.94,"reply":"Siap, aku proses dengan saldo ya.","requires_confirmation":false,"entities":{"product_code":"ML3","customer_id":"69827740(2126)","customer_zone":"2126","payment_method":"deposit"},"tool_call":{"name":"transaksi_create","arguments":{"code":"ML3","target":"69827740(2126)","metode":"deposit","server":"2126"}}}` + "\n")
+	sb.WriteString("User: \"Beli 3dm 69827740 (2126)\"\n")
+	sb.WriteString(`Output: {"intent":"create_prepaid","confidence":0.95,"reply":"Sip, aku proses transaksinya ya.","requires_confirmation":false,"entities":{"product_code":"3DM","customer_id":"69827740(2126)","customer_zone":"2126","payment_method":"deposit"},"tool_call":{"name":"transaksi_create","arguments":{"code":"3DM","target":"69827740(2126)","metode":"deposit","server":"2126"}}}` + "\n")
+	sb.WriteString("User: \"Beli 3dm 69827740 (2126) via saldo ya mas\"\n")
+	sb.WriteString(`Output: {"intent":"create_prepaid","confidence":0.95,"reply":"Sip, aku proses transaksinya ya.","requires_confirmation":false,"entities":{"product_code":"3DM","customer_id":"69827740(2126)","customer_zone":"2126","payment_method":"deposit"},"tool_call":{"name":"transaksi_create","arguments":{"code":"3DM","target":"69827740(2126)","metode":"deposit","server":"2126"}}}` + "\n")
+	sb.WriteString("User: \"halo\"\n")
+	sb.WriteString(`Output: {"intent":"smalltalk_greeting","confidence":0.95,"reply":"Halo! Aku menyediakan berbagai layanan digital:\n\n📱 Pulsa & Paket Data - Telkomsel, Indosat, XL, Tri, Smartfren\n🎮 Top Up Game - Mobile Legends, Free Fire, PUBG, dll\n⚡ Token Listrik - Prabayar & Pascabayar\n💳 Bayar Tagihan - PLN, PDAM, BPJS, dll\n💰 Deposit & Transfer - QRIS, Bank Transfer, E-wallet\n\nKetik nama produk yang kamu cari, contoh: \"pulsa telkomsel 20k\" atau \"top up ML\"","requires_confirmation":false,"entities":{}}` + "\n\n")
+	sb.WriteString("User: \"hai\"\n")
+	sb.WriteString(`Output: {"intent":"smalltalk_greeting","confidence":0.95,"reply":"Halo! Aku menyediakan berbagai layanan digital:\n\n📱 Pulsa & Paket Data - Telkomsel, Indosat, XL, Tri, Smartfren\n🎮 Top Up Game - Mobile Legends, Free Fire, PUBG, dll\n⚡ Token Listrik - Prabayar & Pascabayar\n💳 Bayar Tagihan - PLN, PDAM, BPJS, dll\n💰 Deposit & Transfer - QRIS, Bank Transfer, E-wallet\n\nKetik nama produk yang kamu cari, contoh: \"pulsa telkomsel 20k\" atau \"top up ML\"","requires_confirmation":false,"entities":{}}` + "\n\n")
+	sb.WriteString("User: \"pagi\"\n")
+	sb.WriteString(`Output: {"intent":"smalltalk_greeting","confidence":0.95,"reply":"Selamat pagi! Aku menyediakan berbagai layanan digital:\n\n📱 Pulsa & Paket Data - Telkomsel, Indosat, XL, Tri, Smartfren\n🎮 Top Up Game - Mobile Legends, Free Fire, PUBG, dll\n⚡ Token Listrik - Prabayar & Pascabayar\n💳 Bayar Tagihan - PLN, PDAM, BPJS, dll\n💰 Deposit & Transfer - QRIS, Bank Transfer, E-wallet\n\nKetik nama produk yang kamu cari, contoh: \"pulsa telkomsel 20k\" atau \"top up ML\"","requires_confirmation":false,"entities":{}}` + "\n\n")
+	sb.WriteString("User: \"assalamualaikum\"\n")
+	sb.WriteString(`Output: {"intent":"smalltalk_greeting","confidence":0.95,"reply":"Waalaikumsalam! Aku menyediakan berbagai layanan digital:\n\n📱 Pulsa & Paket Data - Telkomsel, Indosat, XL, Tri, Smartfren\n🎮 Top Up Game - Mobile Legends, Free Fire, PUBG, dll\n⚡ Token Listrik - Prabayar & Pascabayar\n💳 Bayar Tagihan - PLN, PDAM, BPJS, dll\n💰 Deposit & Transfer - QRIS, Bank Transfer, E-wallet\n\nKetik nama produk yang kamu cari, contoh: \"pulsa telkomsel 20k\" atau \"top up ML\"","requires_confirmation":false,"entities":{}}` + "\n\n")
 	sb.WriteString("Konteks percakapan:\n")
 
 	if input.ContextSummary != "" {
@@ -479,5 +518,142 @@ func normaliseJSON(text string) string {
 			}
 		}
 	}
+	// Handle incomplete JSON like {"intent":"create_prepaid","confidence":0.8
+	if strings.HasSuffix(s, "\"") && !strings.HasSuffix(s, "}") {
+		// Try to close the JSON if it's incomplete
+		s = s + "\"}"
+	}
+	// Attempt to balance braces if still unbalanced
+	openBraces := strings.Count(s, "{")
+	closeBraces := strings.Count(s, "}")
+	if openBraces > closeBraces {
+		s = s + strings.Repeat("}", openBraces-closeBraces)
+	}
 	return strings.TrimSpace(s)
+}
+
+// fallbackParseIntent attempts to extract key fields using regex from a malformed or truncated JSON-like string.
+func fallbackParseIntent(raw string) (*IntentResult, error) {
+	r := &IntentResult{
+		Entities: map[string]string{},
+	}
+
+	// Regex extractor (works when closing quotes exist)
+	extract := func(pattern string) string {
+		re := regexp.MustCompile(pattern)
+		m := re.FindStringSubmatch(raw)
+		if len(m) >= 2 {
+			return strings.TrimSpace(m[1])
+		}
+		return ""
+	}
+
+	// Truncated-safe scanner: finds `"key":"value...` even when closing quote is missing
+	scan := func(src, key string) string {
+		keyMark := `"` + key + `"`
+		idx := strings.Index(src, keyMark)
+		if idx < 0 {
+			return ""
+		}
+		colon := strings.Index(src[idx+len(keyMark):], ":")
+		if colon < 0 {
+			return ""
+		}
+		afterColon := src[idx+len(keyMark)+colon+1:]
+		// Expect opening quote
+		open := strings.Index(afterColon, `"`)
+		if open < 0 {
+			return ""
+		}
+		valStart := open + 1
+		rest := afterColon[valStart:]
+		// Find closing quote; if missing, take up to first control char or end
+		close := strings.Index(rest, `"`)
+		val := ""
+		if close >= 0 {
+			val = rest[:close]
+		} else {
+			// Trim at newline or comma or brace to avoid bleeding into next fields
+			end := len(rest)
+			for i, ch := range rest {
+				if ch == '\n' || ch == '\r' || ch == ',' || ch == '}' {
+					end = i
+					break
+				}
+			}
+			val = rest[:end]
+		}
+		return strings.TrimSpace(val)
+	}
+
+	// Core fields
+	r.Intent = extract(`"intent"\s*:\s*"([^"]+)"`)
+	if r.Intent == "" {
+		r.Intent = scan(raw, "intent")
+	}
+
+	confStr := extract(`"confidence"\s*:\s*([0-9\.]+)`)
+	if confStr == "" {
+		confStr = scan(raw, "confidence")
+	}
+	if confStr != "" {
+		if v, err := strconv.ParseFloat(confStr, 64); err == nil {
+			r.Confidence = v
+		}
+	}
+
+	r.Reply = extract(`"reply"\s*:\s*"([^"]*)"`)
+	if r.Reply == "" {
+		r.Reply = scan(raw, "reply")
+	}
+
+	// Entities commonly needed for sales flows
+	if v := extract(`"product_code"\s*:\s*"([^"]+)"`); v != "" {
+		r.Entities["product_code"] = strings.ToUpper(v)
+	} else if v := scan(raw, "product_code"); v != "" {
+		r.Entities["product_code"] = strings.ToUpper(v)
+	}
+
+	if v := extract(`"customer_id"\s*:\s*"([^"]+)"`); v != "" {
+		r.Entities["customer_id"] = v
+	} else if v := scan(raw, "customer_id"); v != "" {
+		r.Entities["customer_id"] = v
+	}
+
+	if v := extract(`"customer_zone"\s*:\s*"([^"]+)"`); v != "" {
+		r.Entities["customer_zone"] = v
+	} else if v := scan(raw, "customer_zone"); v != "" {
+		r.Entities["customer_zone"] = v
+	}
+
+	if v := extract(`"payment_method"\s*:\s*"([^"]+)"`); v != "" {
+		r.Entities["payment_method"] = strings.ToLower(v)
+	} else if v := scan(raw, "payment_method"); v != "" {
+		r.Entities["payment_method"] = strings.ToLower(v)
+	}
+
+	if v := extract(`"provider"\s*:\s*"([^"]+)"`); v != "" {
+		r.Entities["provider"] = strings.ToLower(v)
+	} else if v := scan(raw, "provider"); v != "" {
+		r.Entities["provider"] = strings.ToLower(v)
+	}
+
+	if v := extract(`"product_query"\s*:\s*"([^"]+)"`); v != "" {
+		r.Entities["product_query"] = v
+	} else if v := scan(raw, "product_query"); v != "" {
+		r.Entities["product_query"] = v
+	}
+
+	if v := extract(`"ref_id"\s*:\s*"([^"]+)"`); v != "" {
+		r.Entities["ref_id"] = v
+	} else if v := scan(raw, "ref_id"); v != "" {
+		r.Entities["ref_id"] = v
+	}
+
+	// Basic validation: require at least an intent to proceed
+	if strings.TrimSpace(r.Intent) == "" {
+		return nil, fmt.Errorf("fallback parse: intent not found")
+	}
+
+	return r, nil
 }

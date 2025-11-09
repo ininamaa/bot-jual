@@ -618,6 +618,23 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body io.Reader
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
 
+	// Additional hardened headers to make QRIS generation safer on VPS deployments.
+	// - Set a stable User-Agent instead of default Go http client UA
+	// - Mark X-Requested-With for server-side request identification
+	// - Provide Origin matching baseURL so upstream can apply origin policies
+	// - Keep-alive connection for better performance
+	req.Header.Set("User-Agent", "bot-jual/atlantic-client")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Connection", "keep-alive")
+	if c.baseURL != "" {
+		req.Header.Set("Origin", c.baseURL)
+	}
+
+	// For deposit (QRIS) endpoints, include an explicit client-intent header
+	if strings.Contains(endpoint, "/deposit/") {
+		req.Header.Set("X-Client-Action", "create_deposit_qris")
+	}
+
 	start := time.Now()
 	res, err := c.http.Do(req)
 	if err != nil {
@@ -665,6 +682,17 @@ func classifyHTTPError(status int, body string) error {
 		strings.Contains(lower, "api key invalid") ||
 		strings.Contains(lower, "kredensial tidak") {
 		return fmt.Errorf("%w: %s", ErrInvalidCredential, snippet)
+	}
+	// Check for specific error messages related to insufficient balance or invalid deposit method
+	if strings.Contains(lower, "metode deposit tidak valid") ||
+		strings.Contains(lower, "metode deposit non aktif") ||
+		strings.Contains(lower, "deposit tidak valid") ||
+		strings.Contains(lower, "deposit method tidak valid") ||
+		strings.Contains(lower, "invalid deposit method") ||
+		strings.Contains(lower, "saldo tidak cukup") ||
+		strings.Contains(lower, "insufficient balance") ||
+		strings.Contains(lower, "insufficient funds") {
+		return fmt.Errorf("insufficient balance: %s", snippet)
 	}
 	return fmt.Errorf("atlantic error: status=%d body=%s", status, snippet)
 }

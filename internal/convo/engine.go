@@ -133,14 +133,101 @@ func (e *Engine) ProcessMessage(ctx context.Context, evt *events.Message) {
 		ConversationState: contextSummary,
 	})
 	if err != nil {
-		e.logger.Error("nlu intent detection failed", "error", err)
-		_ = e.respond(ctx, senderJID, "Maaf, sistem sedang sibuk. Coba lagi ya.")
-		return
+		// Fallback: continue with heuristic parsing so critical flows (e.g., "Beli ML3 69827740 (2126)") still run.
+		e.logger.Warn("nlu intent detection failed, using heuristic fallback", "error", err)
+		intent = &nlu.IntentResult{
+			Entities: map[string]string{},
+		}
+		e.enrichIntentFromText(text, intent)
+		// Default to deposit when creating prepaid if method is not specified.
+		if strings.TrimSpace(strings.ToLower(intent.Intent)) == "create_prepaid" {
+			if strings.TrimSpace(intent.Entities["payment_method"]) == "" {
+				intent.Entities["payment_method"] = "deposit"
+			}
+		}
 	}
 
 	e.mergeToolCallArguments(intent)
 	e.enrichIntentFromText(text, intent)
 	e.logger.Debug("resolved intent", "intent", intent.Intent, "entities", intent.Entities, "tool_call", intent.ToolCall)
+
+	// Group chat policy: only respond in group for sales-related intents.
+	// Post a short stub in the group, then continue the full flow via private message (PM).
+	chatIsGroup := evt.Info.Chat.Server == "g.us" || strings.HasSuffix(evt.Info.Chat.String(), "@g.us")
+	if chatIsGroup {
+		// Decide whether this is a sales-related inquiry
+		intentKey := strings.ToLower(strings.TrimSpace(intent.Intent))
+		allowedIntent := map[string]bool{
+			"price_lookup":    true,
+			"budget_filter":   true,
+			"create_prepaid":  true,
+			"check_bill":      true,
+			"pay_bill":        true,
+			"create_deposit":  true,
+			"create_transfer": true,
+			"catalog_all":     true,
+		}[intentKey]
+
+		lower := strings.ToLower(strings.TrimSpace(text))
+		salesKeyword := false
+		if lower != "" {
+			if strings.Contains(lower, "jual") || strings.Contains(lower, "yg jual") || strings.Contains(lower, "yang jual") ||
+				strings.Contains(lower, "ada jual") || strings.Contains(lower, "beli") || strings.Contains(lower, "top up") ||
+				strings.Contains(lower, "topup") || strings.Contains(lower, "isi pulsa") || strings.Contains(lower, "nyari") || strings.Contains(lower, "butuh") {
+				productHints := []string{"pulsa", "paket data", "data", "token", "listrik", "pln", "diamond", "ml", "mobile legend", "free fire", "ff", "pubg", "voucher", "pdam", "bpjs", "tagihan", "game"}
+				for _, kw := range productHints {
+					if strings.Contains(lower, kw) {
+						salesKeyword = true
+						break
+					}
+				}
+			}
+		}
+
+		if !(allowedIntent || salesKeyword) {
+			// Ignore non-sales messages in groups
+			return
+		}
+
+		// Build a short group stub
+		topic := "layanan digital"
+		switch {
+		case strings.Contains(lower, "pulsa") || (strings.Contains(lower, "paket") && strings.Contains(lower, "data")) || strings.Contains(lower, "kuota"):
+			topic = "pulsa/paket data"
+		case strings.Contains(lower, "token") || strings.Contains(lower, "listrik") || strings.Contains(lower, "pln"):
+			topic = "token listrik"
+		case strings.Contains(lower, "ml") || strings.Contains(lower, "mobile legend") || strings.Contains(lower, "free fire") || strings.Contains(lower, "ff") || strings.Contains(lower, "pubg") || strings.Contains(lower, "game") || strings.Contains(lower, "diamond"):
+			topic = "top up game"
+		case strings.Contains(lower, "tagihan") || strings.Contains(lower, "pdam") || strings.Contains(lower, "bpjs") || strings.Contains(lower, "pln"):
+			topic = "bayar tagihan"
+		default:
+			if p := strings.TrimSpace(intent.Entities["provider"]); p != "" {
+				topic = fmt.Sprintf("produk %s", p)
+			}
+		}
+
+		stub := fmt.Sprintf("Saya menjual %s kak. Cek PM ya 🙏", topic)
+
+		if err := e.gateway.SendText(ctx, evt.Info.Chat, stub); err != nil {
+			e.logger.Warn("failed sending group stub", "error", err)
+		} else {
+			if err := e.repo.InsertMessage(ctx, repo.MessageRecord{
+				UserID:    user.ID,
+				Direction: "outgoing",
+				Type:      "group_stub",
+				Content:   &stub,
+			}); err != nil {
+				e.logger.Warn("failed logging group stub", "error", err)
+			}
+		}
+
+		// Continue handling via PM without quoting the group message
+		if err := e.routeIntent(context.Background(), evt, user, text, intent); err != nil {
+			e.logger.Error("intent handling failed (pm)", "error", err, "intent", intent.Intent)
+			_ = e.respond(context.Background(), senderJID, "Maaf, terjadi kesalahan memproses permintaan kamu.")
+		}
+		return
+	}
 
 	if err := e.routeIntent(ctx, evt, user, text, intent); err != nil {
 		e.logger.Error("intent handling failed", "error", err, "intent", intent.Intent)
@@ -153,7 +240,7 @@ func (e *Engine) routeIntent(ctx context.Context, evt *events.Message, user *rep
 	case "smalltalk_greeting", "smalltalk":
 		reply := intent.Reply
 		if reply == "" {
-			reply = "Halo! Ada yang bisa dibantu? Bisa cek harga produk, top up, bayar tagihan, deposit, atau transfer."
+			reply = "Halo! Aku menyediakan berbagai layanan digital:\n\n📱 *Pulsa & Paket Data* - Telkomsel, Indosat, XL, Tri, Smartfren\n🎮 *Top Up Game* - Mobile Legends, Free Fire, PUBG, dll\n⚡ *Token Listrik* - Prabayar & Pascabayar\n💳 *Bayar Tagihan* - PLN, PDAM, BPJS, dll\n💰 *Deposit & Transfer* - QRIS, Bank Transfer, E-wallet\n\nKetik nama produk yang kamu cari, contoh: \"pulsa telkomsel 20k\" atau \"top up ML\""
 		}
 		return e.respondAndLog(ctx, evt.Info.Sender, user.ID, reply, "smalltalk")
 	case "price_lookup":
@@ -274,10 +361,27 @@ func (e *Engine) handleCreatePrepaid(ctx context.Context, evt *events.Message, u
 	productQuery := strings.TrimSpace(intent.Entities["product_query"])
 	productType := strings.TrimSpace(intent.Entities["product_type"])
 	provider := strings.TrimSpace(intent.Entities["provider"])
-	paymentMethod := normalizePaymentMethod(intent.Entities["payment_method"], e.cfg.DefaultDepositMethod)
-	if paymentMethod == "" {
+	rawMethod := strings.TrimSpace(intent.Entities["payment_method"])
+	paymentMethod := normalizePaymentMethod(rawMethod, e.cfg.DefaultDepositMethod)
+
+	// Re-derive intent from the user's actual text and prefer deposit by default.
+	rawLower := strings.ToLower(strings.TrimSpace(extractText(evt)))
+	mentionsDeposit := strings.Contains(rawLower, "deposit") || strings.Contains(rawLower, "saldo") || strings.Contains(rawLower, "pakai saldo")
+	mentionsQris := strings.Contains(rawLower, "qris") || strings.Contains(rawLower, "qr") || strings.Contains(rawLower, "scan") || strings.Contains(rawLower, "transfer")
+
+	// If user explicitly mentions deposit, force deposit.
+	if mentionsDeposit {
+		paymentMethod = "deposit"
+	} else if mentionsQris {
+		// Only prefer QRIS if explicitly mentioned.
+		paymentMethod = "qris"
+	}
+
+	// Default to deposit when unspecified, unrecognized, or likely hallucinated by NLU.
+	if paymentMethod == "" || (paymentMethod != "deposit" && paymentMethod != "qris") || (!mentionsQris && !mentionsDeposit && rawMethod != "") {
 		paymentMethod = "deposit"
 	}
+
 	refID := strings.TrimSpace(intent.Entities["ref_id"])
 	if refID == "" {
 		refID = strings.TrimSpace(intent.Entities["reff_id"])
@@ -813,6 +917,102 @@ func (e *Engine) enrichIntentFromText(text string, intent *nlu.IntentResult) {
 			}
 		}
 	}
+	
+	// Special handling for patterns like "Beli 3dm 69827740 (2126)"
+	// Extract product code and customer ID from patterns like "Beli ML3 12345(2126)"
+	if intent.Intent == "create_prepaid" && (intent.Entities["product_code"] == "" || intent.Entities["customer_id"] == "") {
+		parts := strings.Fields(trimmed)
+		if len(parts) >= 3 {
+			// Look for pattern: "beli [product_code] [customer_id] ([zone])"
+			productCode := strings.ToUpper(strings.TrimSpace(parts[1]))
+			customerPart := strings.TrimSpace(parts[2])
+			if productCode != "" && customerPart != "" {
+				intent.Entities["product_code"] = productCode
+				// Extract customer ID and zone from the third part
+				if strings.Contains(customerPart, "(") && strings.Contains(customerPart, ")") {
+					// Format: 12345678(2126)
+					customerID, zone := extractCustomerTokens(customerPart)
+					intent.Entities["customer_id"] = customerID
+					if zone != "" {
+						intent.Entities["customer_zone"] = zone
+					}
+				} else {
+					// Format: 12345678 2126
+					customerTokens := strings.Fields(customerPart)
+					if len(customerTokens) >= 2 {
+						intent.Entities["customer_id"] = strings.TrimSpace(customerTokens[0])
+						zone := strings.TrimSpace(customerTokens[1])
+						if zone != "" {
+							intent.Entities["customer_zone"] = zone
+						}
+					} else if len(customerTokens) == 1 {
+						// Just customer ID without zone
+						intent.Entities["customer_id"] = strings.TrimSpace(customerTokens[0])
+					}
+				}
+			}
+		}
+	}
+	
+	// Fallback for patterns like "Beli 3dm 69827740 (2126)" if entities are still missing
+	if intent.Intent == "create_prepaid" && intent.Entities["product_code"] == "" && intent.Entities["customer_id"] == "" {
+		parts := strings.Fields(trimmed)
+		if len(parts) >= 3 {
+			// Try to extract product code from the second part
+			productCode := strings.ToUpper(strings.TrimSpace(parts[1]))
+			if productCode != "" {
+				intent.Entities["product_code"] = productCode
+			}
+			// Try to extract customer ID and zone from the third part
+			customerPart := strings.TrimSpace(parts[2])
+			if customerPart != "" {
+				// Check if it's already in the format "ID(zone)"
+				if strings.Contains(customerPart, "(") && strings.Contains(customerPart, ")") {
+					customerID, zone := extractCustomerTokens(customerPart)
+					if customerID != "" {
+						intent.Entities["customer_id"] = customerID
+					}
+					if zone != "" {
+						intent.Entities["customer_zone"] = zone
+					}
+				} else {
+					// Try to split by space and take the first part as ID
+					customerTokens := strings.Fields(customerPart)
+					if len(customerTokens) >= 1 {
+						intent.Entities["customer_id"] = strings.TrimSpace(customerTokens[0])
+					}
+				}
+			}
+		}
+	}
+	
+	// Additional fallback for patterns like "Beli 3dm 69827740 (2126)" if entities are still missing
+	// This handles cases where the NLU didn't properly extract the entities
+	if intent.Intent == "create_prepaid" && (intent.Entities["product_code"] == "" || intent.Entities["customer_id"] == "") {
+		// Try to extract from the original text
+		lowered := strings.ToLower(trimmed)
+		if strings.Contains(lowered, "beli") || strings.Contains(lowered, "buy") {
+			// Extract product code (usually 3dm, ml3, etc.)
+			productCode := extractLikelyProductCode(lowered)
+			if productCode != "" {
+				intent.Entities["product_code"] = strings.ToUpper(productCode)
+			}
+			
+			// Extract customer ID and zone
+			customerID, zone := extractCustomerTokens(trimmed)
+			if customerID != "" {
+				intent.Entities["customer_id"] = customerID
+			}
+			if zone != "" {
+				intent.Entities["customer_zone"] = zone
+			}
+			
+			// Extract payment method if mentioned
+			if strings.Contains(lowered, "via saldo") || strings.Contains(lowered, "pakai saldo") || strings.Contains(lowered, "deposit") {
+				intent.Entities["payment_method"] = "deposit"
+			}
+		}
+	}
 }
 
 func shouldTreatAsProductQuery(text string) bool {
@@ -946,10 +1146,22 @@ func hasAlphaNumeric(token string) bool {
 }
 
 func normalizePaymentMethod(value, fallback string) string {
-	if value == "" {
-		value = fallback
-	}
 	v := strings.ToLower(strings.TrimSpace(value))
+	if v == "" {
+		v = strings.ToLower(strings.TrimSpace(fallback))
+	}
+	if v == "" {
+		return ""
+	}
+	// Prefer deposit if any deposit keywords present.
+	if strings.Contains(v, "saldo") || strings.Contains(v, "deposit") || strings.Contains(v, "balance") {
+		return "deposit"
+	}
+	// Map QRIS/transfer including common variants/typos.
+	if strings.Contains(v, "qris") || strings.Contains(v, "qr") || strings.Contains(v, "scan") ||
+		strings.Contains(v, "transfer") || strings.Contains(v, "instan") || strings.Contains(v, "instant") || strings.Contains(v, "istant") {
+		return "qris"
+	}
 	switch v {
 	case "saldo", "deposit", "balance":
 		return "deposit"
@@ -1204,6 +1416,31 @@ func shouldRetryTargetError(err error) bool {
 	return false
 }
 
+// isTemporaryServerError checks if the error/message indicates a transient server issue worth retrying.
+func isTemporaryServerError(err error, message string) bool {
+	lowerErr := ""
+	if err != nil {
+		lowerErr = strings.ToLower(err.Error())
+	}
+	lowerMsg := strings.ToLower(strings.TrimSpace(message))
+
+	// Common signals of transient backend failures
+	if strings.Contains(lowerErr, "status=500") || strings.Contains(lowerErr, "code=500") {
+		return true
+	}
+	if strings.Contains(lowerErr, "gangguan server") || strings.Contains(lowerErr, "server error") ||
+		strings.Contains(lowerErr, "silahkan coba") || strings.Contains(lowerErr, "coba beberapa saat") {
+		return true
+	}
+	if lowerMsg != "" {
+		if strings.Contains(lowerMsg, "gangguan server") || strings.Contains(lowerMsg, "server error") ||
+			strings.Contains(lowerMsg, "silahkan coba") || strings.Contains(lowerMsg, "coba beberapa saat") {
+			return true
+		}
+	}
+	return false
+}
+
 func productRequiresZone(item *atl.PriceListItem) bool {
 	if item == nil {
 		return false
@@ -1224,6 +1461,93 @@ func productRequiresZone(item *atl.PriceListItem) bool {
 		return true
 	}
 	return false
+}
+
+// retryPrepaidAsync keeps retrying a prepaid transaction on temporary server errors and notifies the user of the outcome.
+func (e *Engine) retryPrepaidAsync(ctx context.Context, userID string, to types.JID, productName string, productCode string, refID string, candidates []string, customerZone string) {
+	// Backoff schedule
+	backoffs := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+	var (
+		resp       *atl.TransactionResponse
+		usedTarget string
+		lastErr    error
+	)
+
+	for i, d := range backoffs {
+		r, u, err := e.createPrepaidWithVariants(ctx, productCode, refID, candidates, userID)
+		if err != nil {
+			lastErr = err
+			if isTemporaryServerError(err, "") && i+1 < len(backoffs) {
+				time.Sleep(d)
+				continue
+			}
+			break
+		}
+		resp = r
+		usedTarget = u
+		break
+	}
+
+	// On success or pending-like status, update order and notify user.
+	if resp != nil {
+		meta := map[string]any{
+			"message": resp.Message,
+			"sn":      resp.SN,
+		}
+		if usedTarget != "" {
+			meta["customer_id"] = usedTarget
+		}
+		if customerZone != "" {
+			meta["customer_zone"] = customerZone
+		}
+		if err := e.repo.UpdateOrderStatus(ctx, refID, resp.Status, meta); err != nil {
+			e.logger.Warn("retry: update order status failed", "error", err, "order_ref", refID)
+		}
+
+		status := strings.ToLower(strings.TrimSpace(resp.Status))
+		switch status {
+		case "", "pending", "processing", "process":
+			msg := fmt.Sprintf("Update: transaksi %s (%s) lagi diproses. Ref: %s.", productName, productCode, refID)
+			if strings.TrimSpace(resp.Message) != "" {
+				msg = fmt.Sprintf("%s %s", msg, strings.TrimSpace(resp.Message))
+			}
+			_ = e.respondAndLog(context.Background(), to, userID, msg, "create_prepaid_retry_pending")
+		case "success", "completed", "ok", "available":
+			msg := fmt.Sprintf("Sukses: transaksi %s (%s) berhasil! Ref: %s.", productName, productCode, refID)
+			if resp.SN != "" {
+				msg = fmt.Sprintf("%s SN: %s.", msg, resp.SN)
+			}
+			if strings.TrimSpace(resp.Message) != "" {
+				msg = fmt.Sprintf("%s %s", msg, strings.TrimSpace(resp.Message))
+			}
+			_ = e.respondAndLog(context.Background(), to, userID, msg, "create_prepaid_retry_success")
+		default:
+			fail := strings.TrimSpace(resp.Message)
+			if fail == "" {
+				fail = "Transaksi gagal. Saldo deposit sepertinya belum cukup."
+			}
+			_ = e.repo.UpdateOrderStatus(ctx, refID, "failed", map[string]any{
+				"message": fail,
+			})
+			msg := fmt.Sprintf("Maaf, transaksi %s (%s) belum berhasil. %s", productName, productCode, fail)
+			_ = e.respondAndLog(context.Background(), to, userID, msg, "create_prepaid_retry_failed")
+		}
+		return
+	}
+
+	// All retries exhausted without a response
+	friendly := friendlyAtlanticError(lastErr)
+	if friendly == "" {
+		friendly = "Transaksi belum bisa diproses karena gangguan sistem."
+	}
+	if err := e.repo.UpdateOrderStatus(ctx, refID, "failed", map[string]any{
+		"error": strings.TrimSpace(lastErr.Error()),
+	}); err != nil {
+		e.logger.Warn("retry: update order after failure", "error", err, "order_ref", refID)
+	}
+	msg := fmt.Sprintf("Maaf, transaksi %s (%s) belum bisa diproses. %s", productName, productCode, friendly)
+	_ = e.respondAndLog(context.Background(), to, userID, msg, "create_prepaid_retry_failed")
 }
 
 func (e *Engine) defaultDepositMethod() string {
@@ -1280,21 +1604,88 @@ func (e *Engine) executePrepaidWithBalance(ctx context.Context, evt *events.Mess
 	if refID == "" {
 		refID = generateRefID("trx")
 	}
+	// Pre-create order so we can update status even if Atlantic returns an error.
+	amount := priceToAmount(item.Price)
+	preMeta := map[string]any{
+		"customer_id": customerID,
+	}
+	if customerZone != "" {
+		preMeta["customer_zone"] = customerZone
+	}
+	preMeta["precreate"] = true
+	if _, err := e.repo.InsertOrder(ctx, repo.Order{
+		UserID:      user.ID,
+		OrderRef:    refID,
+		ProductCode: productCode,
+		Amount:      amount,
+		Status:      "processing",
+		Metadata:    preMeta,
+	}); err != nil {
+		e.logger.Warn("failed precreate order", "error", err, "order_ref", refID)
+	}
+
 	candidates := generateTargetCandidates(customerID, customerZone, rawCustomerID)
-	resp, usedTarget, err := e.createPrepaidWithVariants(ctx, productCode, refID, candidates, user.ID)
-	if err != nil {
-		e.logger.Warn("prepaid transaction failed", "error", err, "user_id", user.ID, "product_code", productCode)
-		friendly := friendlyAtlanticError(err)
+
+	const maxAttempts = 4
+	var (
+		resp       *atl.TransactionResponse
+		usedTarget string
+		lastErr    error
+	)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		r, u, err := e.createPrepaidWithVariants(ctx, productCode, refID, candidates, user.ID)
+		if err != nil {
+			// Retry on transient server errors (e.g., 500 / "gangguan server").
+			if isTemporaryServerError(err, "") && attempt < maxAttempts {
+				time.Sleep(800 * time.Millisecond)
+				continue
+			}
+			lastErr = err
+			break
+		}
+		resp = r
+		usedTarget = u
+		break
+	}
+
+	if resp == nil {
+		// If it's a temporary backend error (e.g., 500 / "gangguan server"), keep order as processing,
+		// queue background retries, and inform user that the transaction is queued.
+		if isTemporaryServerError(lastErr, "") {
+			queuedMsg := fmt.Sprintf("Lagi ada gangguan server. Transaksimu %s (%s) sudah ku antre ya. Ref: %s. Akan ku kabari begitu ada update.", item.Name, item.Code, refID)
+			_ = e.respondAndLog(ctx, evt.Info.Sender, user.ID, queuedMsg, "create_prepaid_queued")
+
+			// Continue attempts in background with backoff.
+			go e.retryPrepaidAsync(context.Background(), user.ID, evt.Info.Sender, item.Name, productCode, refID, candidates, customerZone)
+
+			// Keep user flow clean; do not mark as failed now.
+			return nil
+		}
+
+		// Non-temporary failure after retries.
+		friendly := friendlyAtlanticError(lastErr)
 		if friendly == "" {
-			friendly = "Transaksi belum bisa diproses karena ada kendala pada koneksi Atlantic."
+			friendly = "Transaksi belum bisa diproses karena gangguan sistem. Coba sebentar lagi ya."
+		}
+		failMeta := map[string]any{
+			"customer_id": customerID,
+			"error":       strings.TrimSpace(lastErr.Error()),
+		}
+		if customerZone != "" {
+			failMeta["customer_zone"] = customerZone
+		}
+		if err := e.repo.UpdateOrderStatus(ctx, refID, "failed", failMeta); err != nil {
+			e.logger.Warn("update order after failure", "error", err, "order_ref", refID)
 		}
 		message := fmt.Sprintf("Transaksi %s (%s) gagal diproses. %s", item.Name, item.Code, friendly)
 		return e.respondAndLog(ctx, evt.Info.Sender, user.ID, message, "create_prepaid_failed")
 	}
+
+	// Success path: update order with final status and metadata.
 	if usedTarget != "" {
 		customerID = usedTarget
 	}
-	amount := priceToAmount(item.Price)
 	metadata := map[string]any{
 		"customer_id": customerID,
 		"message":     resp.Message,
@@ -1303,15 +1694,8 @@ func (e *Engine) executePrepaidWithBalance(ctx context.Context, evt *events.Mess
 	if customerZone != "" {
 		metadata["customer_zone"] = customerZone
 	}
-	if _, err := e.repo.InsertOrder(ctx, repo.Order{
-		UserID:      user.ID,
-		OrderRef:    refID,
-		ProductCode: productCode,
-		Amount:      amount,
-		Status:      resp.Status,
-		Metadata:    metadata,
-	}); err != nil {
-		e.logger.Warn("failed storing order", "error", err)
+	if err := e.repo.UpdateOrderStatus(ctx, refID, resp.Status, metadata); err != nil {
+		e.logger.Warn("failed updating order after success", "error", err, "order_ref", refID)
 	}
 
 	status := strings.ToLower(strings.TrimSpace(resp.Status))
@@ -1466,6 +1850,20 @@ func friendlyAtlanticError(err error) string {
 		if extracted := extractAtlanticJSONMessage(candidate); extracted != "" {
 			return extracted
 		}
+	}
+	// Check for specific error messages related to insufficient balance or invalid deposit method
+	lowerMsg := strings.ToLower(msg)
+	if strings.Contains(lowerMsg, "metode deposit tidak valid") ||
+		strings.Contains(lowerMsg, "metode deposit non aktif") ||
+		strings.Contains(lowerMsg, "deposit tidak valid") ||
+		strings.Contains(lowerMsg, "deposit method tidak valid") ||
+		strings.Contains(lowerMsg, "invalid deposit method") {
+		return "Metode deposit tidak valid atau tidak aktif. Coba gunakan metode lain atau hubungi admin."
+	}
+	if strings.Contains(lowerMsg, "saldo tidak cukup") ||
+		strings.Contains(lowerMsg, "insufficient balance") ||
+		strings.Contains(lowerMsg, "insufficient funds") {
+		return "Saldo deposit tidak cukup. Silakan top up deposit terlebih dahulu ya."
 	}
 	return msg
 }
@@ -1814,7 +2212,7 @@ func generateRefID(prefix string) string {
 }
 
 func helpMessage() string {
-	return "Aku bisa bantu cek harga, filter sesuai budget, top up prabayar, cek & bayar tagihan, buat deposit, dan transfer. Ketik contoh: \"pulsa telkomsel 20k\" atau \"budget 5000\"."
+	return "Aku menyediakan berbagai layanan digital:\n\n📱 *Pulsa & Paket Data* - Telkomsel, Indosat, XL, Tri, Smartfren\n🎮 *Top Up Game* - Mobile Legends, Free Fire, PUBG, dll\n⚡ *Token Listrik* - Prabayar & Pascabayar\n💳 *Bayar Tagihan* - PLN, PDAM, BPJS, dll\n💰 *Deposit & Transfer* - QRIS, Bank Transfer, E-wallet\n\nContoh penggunaan:\n• \"pulsa telkomsel 20k\" - cek harga pulsa\n• \"budget 5000\" - tampilkan produk ≤5000\n• \"top up ML 12345\" - beli diamond Mobile Legends\n• \"cek tagihan PLN 123456\" - cek tagihan listrik"
 }
 
 func (e *Engine) depositFeeAmount(gross int64) int64 {

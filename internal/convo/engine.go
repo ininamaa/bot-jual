@@ -662,11 +662,15 @@ func (e *Engine) handleCreateDeposit(ctx context.Context, evt *events.Message, u
 	if netAmount > 0 {
 		metadata["net_amount"] = netAmount
 	}
+	depositAmount := grossAmount
+	if netAmount > 0 {
+		depositAmount = netAmount
+	}
 	if _, err := e.repo.InsertDeposit(ctx, repo.Deposit{
 		UserID:     user.ID,
 		DepositRef: refID,
 		Method:     method,
-		Amount:     grossAmount,
+		Amount:     depositAmount,
 		Status:     depStatus,
 		Metadata:   metadata,
 	}); err != nil {
@@ -2080,11 +2084,15 @@ func (e *Engine) executePrepaidWithCheckout(ctx context.Context, evt *events.Mes
 		shortfall = amountInt - netAmount
 		metadata["net_shortfall"] = shortfall
 	}
+	depositAmount := grossAmount
+	if netAmount > 0 {
+		depositAmount = netAmount
+	}
 	if _, err := e.repo.InsertDeposit(ctx, repo.Deposit{
 		UserID:     user.ID,
 		DepositRef: depositRef,
 		Method:     method,
-		Amount:     grossAmount,
+		Amount:     depositAmount,
 		Status:     depStatus,
 		Metadata:   metadata,
 	}); err != nil {

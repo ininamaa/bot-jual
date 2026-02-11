@@ -449,9 +449,9 @@ func (e *Engine) handleCreatePrepaid(ctx context.Context, evt *events.Message, u
 	case "deposit", "saldo":
 		return e.executePrepaidWithBalance(ctx, evt, user, productCode, customerID, customerZone, rawCustomerID, refID, item, productType)
 	case "bri":
-		return e.executePrepaidWithCheckout(ctx, evt, user, productCode, customerID, customerZone, refID, item, "BRI", productType)
+		return e.executePrepaidWithCheckout(ctx, evt, user, productCode, customerID, customerZone, rawCustomerID, refID, item, "BRI", productType)
 	default:
-		return e.executePrepaidWithCheckout(ctx, evt, user, productCode, customerID, customerZone, refID, item, paymentMethod, productType)
+		return e.executePrepaidWithCheckout(ctx, evt, user, productCode, customerID, customerZone, rawCustomerID, refID, item, paymentMethod, productType)
 	}
 }
 
@@ -536,10 +536,22 @@ func (e *Engine) handleCheckStatus(ctx context.Context, evt *events.Message, use
 	if refID == "" && id == "" {
 		return e.respondAndLog(ctx, evt.Info.Sender, user.ID, "Butuh kode ref transaksi untuk cek status. Contoh: cek status ref 0123456789.", "status_missing_ref")
 	}
+	if refID != "" && e.repo != nil {
+		if dep, err := e.repo.GetDepositByRef(ctx, refID); err == nil && dep != nil && strings.TrimSpace(dep.DepositRef) != "" {
+			statusText := strings.ToUpper(strings.TrimSpace(dep.Status))
+			if statusText == "" {
+				statusText = "UNKNOWN"
+			}
+			reply := fmt.Sprintf("Status deposit %s: %s.", refID, statusText)
+			return e.respondAndLog(ctx, evt.Info.Sender, user.ID, reply, "check_status_deposit")
+		}
+	}
 	productType := strings.TrimSpace(intent.Entities["product_type"])
+	var order *repo.Order
 	if productType == "" && e.repo != nil {
-		if order, err := e.repo.GetOrderByRef(ctx, refID); err == nil && order != nil {
-			productType = strings.TrimSpace(stringValue(order.Metadata, "product_type"))
+		if found, err := e.repo.GetOrderByRef(ctx, refID); err == nil && found != nil {
+			order = found
+			productType = strings.TrimSpace(stringValue(found.Metadata, "product_type"))
 		}
 	}
 	if productType == "" {
@@ -552,6 +564,14 @@ func (e *Engine) handleCheckStatus(ctx context.Context, evt *events.Message, use
 		Type:  productType,
 	})
 	if err != nil {
+		if order != nil && isNotFoundAtlanticError(err) {
+			statusText := strings.ToUpper(strings.TrimSpace(order.Status))
+			if statusText == "" {
+				statusText = "UNKNOWN"
+			}
+			reply := fmt.Sprintf("Status transaksi %s: %s (lokal).", order.OrderRef, statusText)
+			return e.respondAndLog(ctx, evt.Info.Sender, user.ID, reply, "check_status_local")
+		}
 		return e.handleAtlanticFailure(ctx, evt.Info.Sender, user.ID, err, "check_status")
 	}
 	refLabel := refID
@@ -2016,7 +2036,7 @@ func (e *Engine) executePrepaidWithBalance(ctx context.Context, evt *events.Mess
 	}
 }
 
-func (e *Engine) executePrepaidWithCheckout(ctx context.Context, evt *events.Message, user *repo.User, productCode, customerID, customerZone, orderRef string, item *atl.PriceListItem, method, productType string) error {
+func (e *Engine) executePrepaidWithCheckout(ctx context.Context, evt *events.Message, user *repo.User, productCode, customerID, customerZone, rawCustomerID, orderRef string, item *atl.PriceListItem, method, productType string) error {
 	depositRef := generateRefID("dep")
 	orderRef = strings.TrimSpace(orderRef)
 	if orderRef == "" {
@@ -2103,6 +2123,13 @@ func (e *Engine) executePrepaidWithCheckout(ctx context.Context, evt *events.Mes
 		"customer_id":  customerID,
 		"deposit_ref":  depositRef,
 		"product_type": productType,
+	}
+	candidates := generateTargetCandidates(customerID, customerZone, rawCustomerID)
+	if rawCustomerID != "" {
+		orderMetadata["customer_id_raw"] = rawCustomerID
+	}
+	if len(candidates) > 0 {
+		orderMetadata["target_candidates"] = candidates
 	}
 	if customerZone != "" {
 		orderMetadata["customer_zone"] = customerZone
@@ -2265,6 +2292,23 @@ func (e *Engine) sendCheckoutQRImage(ctx context.Context, to types.JID, userID s
 		return false
 	}
 	if err := e.gateway.SendImage(ctx, to, data, "image/png", caption); err != nil {
+
+func isNotFoundAtlanticError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "not found") {
+		return true
+	}
+	if strings.Contains(lower, "tidak ditemukan") {
+		return true
+	}
+	if strings.Contains(lower, "transaksi tidak ditemukan") {
+		return true
+	}
+	return false
+}
 		e.logger.Warn("failed sending qr image", "error", err)
 		return false
 	}

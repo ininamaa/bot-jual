@@ -304,11 +304,41 @@ func (p *AtlanticWebhookProcessor) autoFulfillOrderAfterDeposit(ctx context.Cont
 		p.notifyUser(ctx, order.UserID, msg)
 		return true
 	}
-	resp, err := p.atl.CreatePrepaidTransaction(ctx, atl.CreatePrepaidRequest{
-		ProductCode: order.ProductCode,
-		CustomerID:  customerID,
-		RefID:       order.OrderRef,
-	})
+	candidates := targetCandidatesFromMetadata(order.Metadata)
+	if len(candidates) == 0 {
+		candidates = []string{customerID}
+	}
+	var (
+		resp     *atl.TransactionResponse
+		lastErr  error
+		usedDest string
+	)
+	for _, target := range candidates {
+		attempt := strings.TrimSpace(target)
+		if attempt == "" {
+			continue
+		}
+		r, err := p.atl.CreatePrepaidTransaction(ctx, atl.CreatePrepaidRequest{
+			ProductCode: order.ProductCode,
+			CustomerID:  attempt,
+			RefID:       order.OrderRef,
+		})
+		if err != nil {
+			lastErr = err
+			if isTargetFormatError(err) {
+				continue
+			}
+			break
+		}
+		resp = r
+		usedDest = attempt
+		break
+	}
+	if resp != nil && usedDest != "" {
+		customerID = usedDest
+	}
+	if resp == nil {
+		err := lastErr
 	if err != nil {
 		p.logger.Error("auto create prepaid failed", "error", err, "order_ref", order.OrderRef, "deposit_ref", dep.DepositRef)
 		meta := cloneMetadata(order.Metadata)
@@ -524,4 +554,64 @@ func formatIDR(value int64) string {
 		return "Rp0"
 	}
 	return fmt.Sprintf("Rp%d", value)
+}
+
+func targetCandidatesFromMetadata(meta map[string]any) []string {
+	if meta == nil {
+		return nil
+	}
+	val, ok := meta["target_candidates"]
+	if !ok || val == nil {
+		return nil
+	}
+	switch v := val.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if item == nil {
+				continue
+			}
+			out = append(out, strings.TrimSpace(fmt.Sprintf("%v", item)))
+		}
+		return out
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return nil
+		}
+		parts := strings.Split(trimmed, ",")
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			p := strings.TrimSpace(part)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func isTargetFormatError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	keywords := []string{
+		"format target",
+		"format id",
+		"target tidak sesuai",
+		"format tidak sesuai",
+		"id player",
+		"invalid target",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }

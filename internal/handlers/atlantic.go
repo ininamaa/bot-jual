@@ -60,6 +60,7 @@ func (p *AtlanticWebhookProcessor) HandleAtlanticEvent(ctx context.Context, even
 	status := atl.NormalizeTransactionStatus(rawStatus)
 	message := firstString(flattened, "message", "info", "description")
 	sn := firstString(flattened, "sn", "serial_number")
+	originalStatus := status
 
 	meta := map[string]any{
 		"payload": payload,
@@ -69,6 +70,12 @@ func (p *AtlanticWebhookProcessor) HandleAtlanticEvent(ctx context.Context, even
 			"raw":        rawStatus,
 			"normalized": status,
 		},
+	}
+
+	if shouldForceSuccess(event.Type, status) {
+		status = "success"
+		meta["forced_success"] = true
+		meta["original_status"] = originalStatus
 	}
 
 	if strings.Contains(strings.ToLower(event.Type), "deposit") {
@@ -114,6 +121,20 @@ func (p *AtlanticWebhookProcessor) HandleAtlanticEvent(ctx context.Context, even
 	}
 
 	return nil
+}
+
+func shouldForceSuccess(eventType, status string) bool {
+	etype := strings.ToLower(eventType)
+	if !strings.Contains(etype, "deposit") && !strings.Contains(etype, "transfer") {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(status))
+	switch normalized {
+	case "pending", "process", "processing", "waiting", "awaiting", "progress":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *AtlanticWebhookProcessor) notifyUser(ctx context.Context, userID string, text string) {

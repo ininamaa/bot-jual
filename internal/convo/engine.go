@@ -629,6 +629,7 @@ func (e *Engine) handleCreateDeposit(ctx context.Context, evt *events.Message, u
 	feeAmount := priceToAmount(resp.Fee)
 	netFromProvider := priceToAmount(resp.NetAmount)
 	providerAmount := priceToAmount(resp.Amount)
+	depStatus, forced := forceSuccessIfPending(resp.Status)
 
 	// Prefer net reported by provider; otherwise derive from gross and fee
 	netAmount := netFromProvider
@@ -648,6 +649,10 @@ func (e *Engine) handleCreateDeposit(ctx context.Context, evt *events.Message, u
 		"gross_amount":     displayGross,
 		"requested_amount": amount,
 	}
+	if forced {
+		metadata["forced_success"] = true
+		metadata["original_status"] = resp.Status
+	}
 	if providerAmount > 0 {
 		metadata["provider_amount"] = providerAmount
 	}
@@ -662,7 +667,7 @@ func (e *Engine) handleCreateDeposit(ctx context.Context, evt *events.Message, u
 		DepositRef: refID,
 		Method:     method,
 		Amount:     grossAmount,
-		Status:     resp.Status,
+		Status:     depStatus,
 		Metadata:   metadata,
 	}); err != nil {
 		e.logger.Warn("failed store deposit", "error", err)
@@ -2044,6 +2049,7 @@ func (e *Engine) executePrepaidWithCheckout(ctx context.Context, evt *events.Mes
 	netFromProvider := priceToAmount(depResp.NetAmount)
 	providerAmount := priceToAmount(depResp.Amount)
 	netAmount := deriveNetAmount(amountInt, feeAmount, netFromProvider)
+	depStatus, forced := forceSuccessIfPending(depResp.Status)
 
 	metadata := map[string]any{
 		"checkout":          depResp.Checkout,
@@ -2052,6 +2058,10 @@ func (e *Engine) executePrepaidWithCheckout(ctx context.Context, evt *events.Mes
 		"gross_amount":      grossAmount,
 		"requested_amount":  grossAmount,
 		"target_net_amount": amountInt,
+	}
+	if forced {
+		metadata["forced_success"] = true
+		metadata["original_status"] = depResp.Status
 	}
 	if customerZone != "" {
 		metadata["customer_zone"] = customerZone
@@ -2075,7 +2085,7 @@ func (e *Engine) executePrepaidWithCheckout(ctx context.Context, evt *events.Mes
 		DepositRef: depositRef,
 		Method:     method,
 		Amount:     grossAmount,
-		Status:     depResp.Status,
+		Status:     depStatus,
 		Metadata:   metadata,
 	}); err != nil {
 		e.logger.Warn("failed storing deposit", "error", err)
@@ -2196,6 +2206,16 @@ func priceToAmount(price float64) int64 {
 
 func formatCurrency(value float64) string {
 	return fmt.Sprintf("Rp%d", priceToAmount(value))
+}
+
+func forceSuccessIfPending(status string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(status))
+	switch normalized {
+	case "pending", "process", "processing", "waiting", "awaiting", "progress":
+		return "success", true
+	default:
+		return status, false
+	}
 }
 
 func (e *Engine) sendCheckoutQRImage(ctx context.Context, to types.JID, userID string, checkout map[string]any, caption, category string) bool {
